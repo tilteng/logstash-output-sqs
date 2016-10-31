@@ -3,7 +3,6 @@ require "logstash/outputs/base"
 require "logstash/namespace"
 require "logstash/plugin_mixins/aws_config"
 require "stud/buffer"
-require "digest/sha2"
 
 # Push events to an Amazon Web Services Simple Queue Service (SQS) queue.
 #
@@ -58,7 +57,7 @@ require "digest/sha2"
 # See http://aws.amazon.com/iam/ for more details on setting up AWS identities.
 #
 class LogStash::Outputs::SQS < LogStash::Outputs::Base
-  include LogStash::PluginMixins::AwsConfig
+  include LogStash::PluginMixins::AwsConfig::V2
   include Stud::Buffer
 
   config_name "sqs"
@@ -66,71 +65,83 @@ class LogStash::Outputs::SQS < LogStash::Outputs::Base
   # Name of SQS queue to push messages into. Note that this is just the name of the queue, not the URL or ARN.
   config :queue, :validate => :string, :required => true
 
-  # Set to true if you want send messages to SQS in batches with `batch_send`
-  # from the amazon sdk
-  config :batch, :validate => :boolean, :default => true
+  # Maximum number of events in a batch.
+  config :batch_size, :validate => :number, :default => 10
 
-  # If `batch` is set to true, the number of events we queue up for a `batch_send`.
-  config :batch_events, :validate => :number, :default => 10
+  # Maximum time between sending messages to SQS in a batch.
+  config :batch_timeout, :validate => :number, :default => 10
 
-  # If `batch` is set to true, the maximum amount of time between `batch_send` commands when there are pending events to flush.
-  config :batch_timeout, :validate => :number, :default => 5
+  # Maximum total bytesize of a batch.
+  config :batch_bytesize, :validate => :number, :default => 60 * 1024
+
+  # Deprecated configuration options
+  config :batch, :validate => :boolean, :default => false
+  config :batch_events, :validate => :number, :default => 0
 
   public
-  def aws_service_endpoint(region)
-    return {
-        :sqs_endpoint => "sqs.#{region}.amazonaws.com"
-    }
-  end
-
-  public 
   def register
     require "aws-sdk"
 
-    @sqs = AWS::SQS.new(aws_options_hash)
-
     if @batch
-      if @batch_events > 10
-        raise RuntimeError.new(
-          "AWS only allows a batch_events parameter of 10 or less"
-        )
-      elsif @batch_events <= 1
-        raise RuntimeError.new(
-          "batch_events parameter must be greater than 1 (or its not a batch)"
-        )
-      end
-      buffer_initialize(
-        :max_items => @batch_events,
-        :max_interval => @batch_timeout,
-        :logger => @logger
-      )
+      @logger.warn(":batch configuration option is now deprecated. Set :batch_size to 1 to immediately flush each event to SQS.")
+    end
+    if @batch_events != 0
+      @logger.warn(":batch_events configuration option is now deprecated. Use :batch_size instead.")
+      @batch_size = @batch_events
     end
 
-    begin
-      @logger.debug("Connecting to AWS SQS queue '#{@queue}'...")
-      @sqs_queue = @sqs.queues.named(@queue)
-      @logger.info("Connected to AWS SQS queue '#{@queue}' successfully.")
-    rescue Exception => e
-      @logger.error("Unable to access SQS queue '#{@queue}': #{e.to_s}")
-    end # begin/rescue
+    @aws_sqs_client = Aws::SQS::Client.new(aws_options_hash)
+    @queue_url = @aws_sqs_client.get_queue_url(:queue_name => @queue)[:queue_url]
+
+    @current_bytesize = 0
+    @current_bytesize_mutex = Mutex.new
+
+    buffer_initialize(
+      :max_items => @batch_size,
+      :max_interval => @batch_timeout,
+      :logger => @logger
+    )
   end # def register
 
-  public
   def receive(event)
-    if @batch
-      buffer_receive(event.to_json)
-      return
-    end
-    @sqs_queue.send_message(event.to_json)
+    data = event.to_json
+    buffer_receive(data)
+    increment_bytesize(data)
   end # def receive
 
   # called from Stud::Buffer#buffer_flush when there are events to flush
   def flush(events, close=false)
-    @sqs_queue.batch_send(events)
+    decrement_bytesize(events)
+    @aws_sqs_client.send_message({
+      queue_url: @queue_url,
+      message_body: "[#{events.join(",")}]"
+    })
+
   end
 
-  public
+  def on_flush_error(e)
+    @logger.error(
+      "Error flushing to SQS",
+      :exception => e.class.name,
+      :backtrace => e.backtrace
+    )
+  end
+
   def close
     buffer_flush(:final => true)
-  end # def close
+  end
+
+  private
+  def decrement_bytesize(items)
+    total_size = items.reduce(0) { |prev, curr| prev + curr.bytesize }
+    bytesize = @current_bytesize_mutex.synchronize { @current_bytesize -= total_size }
+  end
+
+  private
+  def increment_bytesize(item)
+    bytesize = @current_bytesize_mutex.synchronize { @current_bytesize += item.bytesize }
+    if bytesize > @batch_bytesize
+      buffer_flush(:force => true)
+    end
+  end
 end
